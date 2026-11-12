@@ -1,0 +1,253 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function isServant() { return signedIn() && userDoc().data.role == 'servant'; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function memberDoc(id) { return get(/databases/$(database)/documents/members/$(id)); }
+    // نقاط التصويت (إعداد اختياري config/main.votePts، الافتراضي 1، الحد الأقصى 5)
+    function votePts() {
+      return exists(/databases/$(database)/documents/config/main)
+        ? (get(/databases/$(database)/documents/config/main).data.get('votePts', 1) is int
+            ? get(/databases/$(database)/documents/config/main).data.get('votePts', 1) : 1)
+        : 1;
+    }
+
+    // 4.1.0: إعدادات من config/main بقيم افتراضية آمنة
+    function cfgNum(k, d) {
+      return exists(/databases/$(database)/documents/config/main)
+        && get(/databases/$(database)/documents/config/main).data.get(k, d) is number
+        ? get(/databases/$(database)/documents/config/main).data.get(k, d) : d;
+    }
+    function welcomePts() { return cfgNum('welcomePts', 5); }
+    // غرفة كورال: الخادم يقرأ كل الغرف، والمخدوم غرفة كوراله فقط
+    function choirOk(c) { return c in ['ib', 'ie', 'th', 'am', 'ql']; }
+    function canChoirRoom(c) {
+      return signedIn() && choirOk(c) && (isServant()
+        || (userDoc().data.role == 'member' && userDoc().data.memberId is string
+            && memberDoc(userDoc().data.memberId).data.choir == c));
+    }
+    function msgShape(d, room, id) {
+      return d.keys().hasOnly(['messageId','senderUid','senderName','senderPhoto','senderRole','choirId','text','createdAt'])
+        && d.keys().hasAll(['messageId','senderUid','senderName','senderPhoto','senderRole','choirId','text','createdAt'])
+        && d.messageId == id && d.senderUid == request.auth.uid
+        && d.senderName == userDoc().data.name && d.senderRole == userDoc().data.role
+        && d.choirId == room
+        && d.text is string && d.text.size() > 0 && d.text.size() <= 1000
+        && d.createdAt == request.time
+        && d.senderPhoto is string && d.senderPhoto.size() <= 8000
+        && (d.senderPhoto == '' || d.senderPhoto.matches('^data:image/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$'));
+    }
+
+    // كود الخدام محفوظ في مستند لا يقرؤه أحد من التطبيق: secrets/servant  { code: "2558" }
+    match /secrets/{id} { allow read, write: if false; }
+
+    match /users/{userId} {
+      function userKeys(d) {
+        return d.keys().hasOnly(['name','role','contact','phone','memberId','createdAt','servantCode','mustChangePw','photo']);
+      }
+      allow read: if signedIn() && (request.auth.uid == userId || isServant());
+      // تسجيل ذاتي: المخدوم لا يربط نفسه إلا بسجل uid فيه = uid بتاعه (يُنشأ في نفس الـ batch)
+      allow create: if signedIn() && request.auth.uid == userId && userKeys(request.resource.data) && (
+        (request.resource.data.role == 'member' && request.resource.data.memberId is string
+          && !('servantCode' in request.resource.data) && !('mustChangePw' in request.resource.data)
+          && getAfter(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.get('uid', '') == request.auth.uid)
+        || (request.resource.data.role == 'servant'
+          && request.resource.data.servantCode == get(/databases/$(database)/documents/secrets/servant).data.code));
+      // 4.1.0 — تفعيل حساب مخدوم موجود: الخادم ينشئ users/{newUid} وفي نفس الـ batch يضع members.uid (مرة واحدة فقط)
+      allow create: if isServant() && request.auth.uid != userId && userKeys(request.resource.data)
+        && request.resource.data.role == 'member' && request.resource.data.memberId is string
+        && !('servantCode' in request.resource.data)
+        && get(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.get('uid', '') == ''
+        && getAfter(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.get('uid', '') == userId;
+      // تعديل الحساب لنفسه (الدور role لا يمكن تغييره أبدًا)
+      allow update: if signedIn() && request.auth.uid == userId
+                    && changed().hasOnly(['name', 'contact', 'phone', 'servantCode', 'photo'])
+                    && (!('photo' in changed()) || (request.resource.data.photo is string && request.resource.data.photo.size() <= 40000));
+      // إنهاء «تغيير الباسورد الإجباري» (true -> false فقط)
+      allow update: if signedIn() && request.auth.uid == userId
+                    && changed().hasOnly(['mustChangePw']) && request.resource.data.mustChangePw == false;
+      // الخادم يزامن اسم/رقم حساب المخدوم
+      allow update: if isServant() && resource.data.role == 'member' && changed().hasOnly(['name', 'phone', 'contact']);
+      // ربط حساب موجود بسجل مخدوم: فقط لو members.uid يطابق نفس الحساب
+      allow update: if isServant() && resource.data.role == 'member' && changed().hasOnly(['memberId'])
+                    && request.resource.data.memberId is string
+                    && getAfter(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.get('uid', '') == userId;
+      allow delete: if isServant();
+    }
+
+    match /members/{memberId} {
+      function adjDoc(id) { return /databases/$(database)/documents/adjustments/$(id); }
+      // صرف النقاط الترحيبية مرة واحدة: المؤهل فقط + مستند adjustments/welcome_{id} يُنشأ في نفس العملية (ولا يُنشأ مرتين)
+      function welcomeOk() {
+        return resource.data.get('welcomeEligible', false) == true
+          && resource.data.get('welcomePaid', false) == false
+          && request.resource.data.welcomePaid == true
+          && existsAfter(adjDoc('welcome_' + memberId)) && !exists(adjDoc('welcome_' + memberId))
+          && request.resource.data.points - resource.data.get('points', 0) == getAfter(adjDoc('welcome_' + memberId)).data.pts;
+      }
+      // قواعد الخادم: لا يغيّر uid إلا من فارغ (تفعيل)، ولا يمنح الأهلية، ولا يصرف الترحيبية خارج المسار الآمن
+      function servantEditOk() {
+        return isServant()
+          && !('welcomeEligible' in changed())
+          && (!('uid' in changed()) || resource.data.get('uid', '') == '')
+          && (!('welcomePaid' in changed()) || welcomeOk());
+      }
+      // حضور المخدوم لنفسه: النقاط تساوي pts مستند الحضور المُنشأ في نفس العملية (مرة واحدة لكل حدث)
+      function selfCheckInOk() {
+        return changed().hasOnly(['points', 'attended', 'lastAtt'])
+          && request.resource.data.lastAtt is string
+          && request.resource.data.attended == resource.data.attended + 1
+          && existsAfter(/databases/$(database)/documents/attendance/$(request.resource.data.lastAtt))
+          && !exists(/databases/$(database)/documents/attendance/$(request.resource.data.lastAtt))
+          && getAfter(/databases/$(database)/documents/attendance/$(request.resource.data.lastAtt)).data.memberId == memberId
+          && request.resource.data.points - resource.data.points == getAfter(/databases/$(database)/documents/attendance/$(request.resource.data.lastAtt)).data.pts;
+      }
+      allow read: if signedIn();
+      allow create: if (isServant() && request.resource.data.get('uid', '') == ''
+                        && request.resource.data.get('welcomePaid', false) == false)
+        || (signedIn() && request.resource.data.uid == request.auth.uid
+            && request.resource.data.points == 0 && request.resource.data.attended == 0
+            && request.resource.data.get('welcomePaid', false) == false
+            && !('lastAtt' in request.resource.data));
+      allow update: if servantEditOk()
+        || (signedIn() && resource.data.uid == request.auth.uid && (
+             changed().hasOnly(['photo', 'phone', 'birth', 'name'])
+             || selfCheckInOk()
+             // نقطة التصويت: مرة واحدة لكل تصويت، مرتبطة بمستند pollVotes أُنشئ في نفس الـ batch
+             || (changed().hasOnly(['points', 'lastVotePoll'])
+                 && request.resource.data.lastVotePoll is string
+                 && request.resource.data.points - resource.data.points == votePts()
+                 && votePts() > 0
+                 && existsAfter(/databases/$(database)/documents/pollVotes/$(request.resource.data.lastVotePoll + '_' + memberId))
+                 && !exists(/databases/$(database)/documents/pollVotes/$(request.resource.data.lastVotePoll + '_' + memberId)))));
+      allow delete: if isServant();
+    }
+
+    match /events/{eventId} {
+      allow read: if signedIn();
+      allow write: if isServant();
+    }
+
+    match /attendance/{attendanceId} {
+      allow read: if signedIn() && (isServant() || resource == null || resource.data.memberId == userDoc().data.memberId);
+      allow create: if isServant() || (signedIn()
+          && memberDoc(request.resource.data.memberId).data.uid == request.auth.uid
+          && attendanceId == request.resource.data.eventId + '_' + request.resource.data.memberId
+          && request.resource.data.pts >= 0 && request.resource.data.pts <= cfgNum('max', 5)
+          && request.time.toMillis() >= get(/databases/$(database)/documents/events/$(request.resource.data.eventId)).data.when - 31 * 60 * 1000
+          && request.time.toMillis() <= get(/databases/$(database)/documents/events/$(request.resource.data.eventId)).data.when + 181 * 60 * 1000);
+      allow update, delete: if isServant();
+    }
+
+    match /adjustments/{adjId} {
+      function welcomeAdjOk() {
+        return request.resource.data.type == 'welcome'
+          && adjId == 'welcome_' + request.resource.data.memberId
+          && request.resource.data.pts == welcomePts() && welcomePts() > 0
+          && memberDoc(request.resource.data.memberId).data.get('welcomeEligible', false) == true
+          && memberDoc(request.resource.data.memberId).data.get('welcomePaid', false) == false
+          && getAfter(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.get('welcomePaid', false) == true;
+      }
+      allow read: if signedIn() && (isServant() || resource == null || resource.data.memberId == userDoc().data.memberId);
+      // معرّف welcome_* ونوع welcome محجوزان للمسار الآمن (إنشاء فقط، لا تعديل ولا حذف)
+      allow create: if isServant()
+        && (!adjId.matches('welcome_.*') || request.resource.data.get('type', '') == 'welcome')
+        && (request.resource.data.get('type', '') != 'welcome' || welcomeAdjOk());
+      allow update, delete: if isServant() && resource.data.get('type', '') != 'welcome' && !adjId.matches('welcome_.*');
+    }
+
+    match /notifs/{notificationId} {
+      allow read: if signedIn() && (isServant()
+          || resource.data.to == 'all'
+          || resource.data.to == userDoc().data.memberId
+          || resource.data.to == memberDoc(userDoc().data.memberId).data.choir);
+      allow create, update, delete: if isServant();
+    }
+
+    match /config/{configId} {
+      allow read: if signedIn();
+      allow write: if isServant();
+    }
+
+    // ====== إضافات v4 (دمج مميزات Silent Monk) — لا تمس القواعد الأعلى ======
+
+    // الترانيم والمجلدات: القراءة لكل مسجّل، الكتابة للخادم فقط (حذف ناعم عبر deleted)
+    match /hymnFolders/{folderId} {
+      allow read: if signedIn();
+      allow create: if isServant() && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80;
+      allow update: if isServant() && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80;
+      allow delete: if isServant();
+    }
+    match /hymns/{hymnId} {
+      allow read: if signedIn();
+      allow create, update: if isServant() && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
+                    && request.resource.data.folderId is string
+                    && request.resource.data.get('audioUrl', '') is string
+                    && request.resource.data.get('audioUrl', '').matches('^(https://.*)?$');
+      allow delete: if isServant();
+    }
+
+    // التصويت
+    match /polls/{pollId} {
+      allow read: if signedIn();
+      allow create, delete: if isServant();
+      allow update: if isServant()
+        || (signedIn() && changed().hasOnly(['total'])
+            && request.resource.data.total == resource.data.get('total', 0) + 1
+            && existsAfter(/databases/$(database)/documents/pollVotes/$(pollId + '_' + userDoc().data.memberId))
+            && !exists(/databases/$(database)/documents/pollVotes/$(pollId + '_' + userDoc().data.memberId)));
+    }
+    // مستند الصوت: المعرّف pollId_memberId يمنع التصويت المكرر
+    match /pollVotes/{voteId} {
+      allow read: if signedIn() && (isServant() || resource == null || resource.data.memberId == userDoc().data.memberId);
+      allow create: if signedIn() && userDoc().data.role == 'member'
+          && request.resource.data.memberId == userDoc().data.memberId
+          && memberDoc(request.resource.data.memberId).data.uid == request.auth.uid
+          && voteId == request.resource.data.pollId + '_' + request.resource.data.memberId
+          && get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.isActive == true
+          && get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.get('deleted', false) == false
+          && (get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.choir == 'all'
+              || get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.choir == memberDoc(request.resource.data.memberId).data.choir)
+          && request.resource.data.choices is list
+          && request.resource.data.choices.size() >= 1 && request.resource.data.choices.size() <= 10
+          && (get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.allowMultiple == true
+              || request.resource.data.choices.size() == 1)
+          && request.resource.data.pts == votePts();
+      allow update, delete: if isServant();
+    }
+
+    // ====== إضافات v4.1.0 ======
+
+    // غرف الكورالات: المخدوم يقرأ ويكتب في غرفة كوراله فقط، والخادم يتابع كل الغرف.
+    // لا تعديل ولا حذف للرسائل (للجميع). لا توجد قاعدة عامة signedIn() على الشات.
+    match /choirChats/{choirId}/messages/{messageId} {
+      allow read: if canChoirRoom(choirId);
+      allow create: if canChoirRoom(choirId) && msgShape(request.resource.data, choirId, messageId);
+      allow update, delete: if false;
+    }
+    // غرفة «اجتماع الخدام»: الخدام فقط (role == servant). المخدوم ممنوع من القراءة والكتابة حتى بالوصول المباشر للمسار.
+    match /servantChat/{roomId}/messages/{messageId} {
+      allow read: if isServant() && roomId == 'main';
+      allow create: if isServant() && roomId == 'main' && msgShape(request.resource.data, 'servants', messageId);
+      allow update, delete: if false;
+    }
+    // طلبات إدارية تُنفَّذ خارج التطبيق (GitHub Actions + Admin SDK). لا تحتوي كلمات مرور.
+    // التنفيذ يتحقق مرة ثانية من صلاحية صاحب الطلب. التحديث والحذف للـ Admin SDK فقط (يتجاوز القواعد).
+    match /adminRequests/{reqId} {
+      allow read: if isServant();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['type','targetUid','memberId','newPhone','requestedBy','requestedByName','status','createdAt'])
+        && request.resource.data.requestedBy == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.type in ['resetPassword', 'changePhone']
+        && request.resource.data.targetUid is string
+        && (isServant() || (request.resource.data.type == 'changePhone' && request.resource.data.targetUid == request.auth.uid));
+      allow update, delete: if false;
+    }
+  }
+}

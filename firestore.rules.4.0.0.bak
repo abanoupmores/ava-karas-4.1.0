@@ -1,0 +1,137 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function isServant() { return signedIn() && userDoc().data.role == 'servant'; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function memberDoc(id) { return get(/databases/$(database)/documents/members/$(id)); }
+    // نقاط التصويت (إعداد اختياري config/main.votePts، الافتراضي 1، الحد الأقصى 5)
+    function votePts() {
+      return exists(/databases/$(database)/documents/config/main)
+        ? (get(/databases/$(database)/documents/config/main).data.get('votePts', 1) is int
+            ? get(/databases/$(database)/documents/config/main).data.get('votePts', 1) : 1)
+        : 1;
+    }
+
+    // كود الخدام محفوظ في مستند لا يقرؤه أحد من التطبيق: secrets/servant  { code: "2558" }
+    match /secrets/{id} { allow read, write: if false; }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isServant());
+      allow create: if signedIn() && request.auth.uid == userId && (
+        (request.resource.data.role == 'member' && request.resource.data.memberId is string
+          && !('servantCode' in request.resource.data))
+        || (request.resource.data.role == 'servant'
+          && request.resource.data.servantCode == get(/databases/$(database)/documents/secrets/servant).data.code));
+      allow update: if signedIn() && request.auth.uid == userId
+                    && changed().hasOnly(['name', 'contact', 'phone', 'servantCode']);
+      allow delete: if isServant();
+    }
+
+    match /members/{memberId} {
+      allow read: if signedIn();
+      allow create: if isServant() || (signedIn() && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.points == 0 && request.resource.data.attended == 0);
+      allow update: if isServant()
+        || (signedIn() && resource.data.uid == request.auth.uid && (
+             changed().hasOnly(['photo', 'phone', 'birth', 'name'])
+             || (changed().hasOnly(['points', 'attended'])
+                 && request.resource.data.attended == resource.data.attended + 1
+                 && request.resource.data.points - resource.data.points >= 0
+                 && request.resource.data.points - resource.data.points <= 20)
+             // نقطة التصويت: مرة واحدة لكل تصويت، مرتبطة بمستند pollVotes أُنشئ في نفس الـ batch
+             || (changed().hasOnly(['points', 'lastVotePoll'])
+                 && request.resource.data.lastVotePoll is string
+                 && request.resource.data.points - resource.data.points == votePts()
+                 && votePts() > 0
+                 && existsAfter(/databases/$(database)/documents/pollVotes/$(request.resource.data.lastVotePoll + '_' + memberId))
+                 && !exists(/databases/$(database)/documents/pollVotes/$(request.resource.data.lastVotePoll + '_' + memberId)))));
+      allow delete: if isServant();
+    }
+
+    match /events/{eventId} {
+      allow read: if signedIn();
+      allow write: if isServant();
+    }
+
+    match /attendance/{attendanceId} {
+      allow read: if signedIn() && (isServant() || resource.data.memberId == userDoc().data.memberId);
+      allow create: if isServant() || (signedIn()
+          && memberDoc(request.resource.data.memberId).data.uid == request.auth.uid
+          && attendanceId == request.resource.data.eventId + '_' + request.resource.data.memberId
+          && request.resource.data.pts >= 0 && request.resource.data.pts <= 20
+          && request.time.toMillis() >= get(/databases/$(database)/documents/events/$(request.resource.data.eventId)).data.when - 31 * 60 * 1000
+          && request.time.toMillis() <= get(/databases/$(database)/documents/events/$(request.resource.data.eventId)).data.when + 181 * 60 * 1000);
+      allow update, delete: if isServant();
+    }
+
+    match /adjustments/{adjId} {
+      allow read: if signedIn() && (isServant() || resource.data.memberId == userDoc().data.memberId);
+      allow write: if isServant();
+    }
+
+    match /notifs/{notificationId} {
+      allow read: if signedIn() && (isServant()
+          || resource.data.to == 'all'
+          || resource.data.to == userDoc().data.memberId
+          || resource.data.to == memberDoc(userDoc().data.memberId).data.choir);
+      allow create, update, delete: if isServant();
+    }
+
+    match /config/{configId} {
+      allow read: if signedIn();
+      allow write: if isServant();
+    }
+
+    // ====== إضافات v4 (دمج مميزات Silent Monk) — لا تمس القواعد الأعلى ======
+
+    // الترانيم والمجلدات: القراءة لكل مسجّل، الكتابة للخادم فقط (حذف ناعم عبر deleted)
+    match /hymnFolders/{folderId} {
+      allow read: if signedIn();
+      allow create: if isServant() && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80;
+      allow update: if isServant() && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80;
+      allow delete: if isServant();
+    }
+    match /hymns/{hymnId} {
+      allow read: if signedIn();
+      allow create, update: if isServant() && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 120
+                    && request.resource.data.folderId is string
+                    && request.resource.data.get('audioUrl', '') is string
+                    && request.resource.data.get('audioUrl', '').matches('^(https://.*)?$');
+      allow delete: if isServant();
+    }
+
+    // التصويت
+    match /polls/{pollId} {
+      allow read: if signedIn();
+      allow create, delete: if isServant();
+      allow update: if isServant()
+        || (signedIn() && changed().hasOnly(['total'])
+            && request.resource.data.total == resource.data.get('total', 0) + 1
+            && existsAfter(/databases/$(database)/documents/pollVotes/$(pollId + '_' + userDoc().data.memberId))
+            && !exists(/databases/$(database)/documents/pollVotes/$(pollId + '_' + userDoc().data.memberId)));
+    }
+    // مستند الصوت: المعرّف pollId_memberId يمنع التصويت المكرر
+    match /pollVotes/{voteId} {
+      allow read: if signedIn() && (isServant() || resource.data.memberId == userDoc().data.memberId);
+      allow create: if signedIn() && userDoc().data.role == 'member'
+          && request.resource.data.memberId == userDoc().data.memberId
+          && memberDoc(request.resource.data.memberId).data.uid == request.auth.uid
+          && voteId == request.resource.data.pollId + '_' + request.resource.data.memberId
+          && get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.isActive == true
+          && get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.get('deleted', false) == false
+          && (get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.choir == 'all'
+              || get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.choir == memberDoc(request.resource.data.memberId).data.choir)
+          && request.resource.data.choices is list
+          && request.resource.data.choices.size() >= 1 && request.resource.data.choices.size() <= 10
+          && (get(/databases/$(database)/documents/polls/$(request.resource.data.pollId)).data.allowMultiple == true
+              || request.resource.data.choices.size() == 1)
+          && request.resource.data.pts == votePts();
+      allow update, delete: if isServant();
+    }
+  }
+}
