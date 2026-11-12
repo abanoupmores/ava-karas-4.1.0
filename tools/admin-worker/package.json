@@ -1,0 +1,7 @@
+{
+  "name": "abba-karas-admin-worker",
+  "private": true,
+  "type": "module",
+  "version": "4.1.0",
+  "dependencies": { "firebase-admin": "^12.7.0" }
+}

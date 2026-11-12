@@ -1,0 +1,17 @@
+{
+  "name": "abba-karas-desktop",
+  "version": "4.1.0",
+  "description": "كورال الأنبا كاراس - نسخة الكمبيوتر",
+  "main": "main.js",
+  "author": "Abba Karas Choir",
+  "scripts": { "start": "electron .", "dist": "electron-builder --win --publish never" },
+  "devDependencies": { "electron": "^31.7.7", "electron-builder": "^24.13.3" },
+  "build": {
+    "appId": "org.abbakaras.choir",
+    "productName": "AbbaKarasChoir",
+    "files": ["main.js", "www/**"],
+    "icon": "build/icon.png",
+    "win": { "target": ["portable", "nsis"] },
+    "nsis": { "oneClick": true, "perMachine": false }
+  }
+}
