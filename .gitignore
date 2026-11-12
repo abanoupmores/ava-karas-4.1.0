@@ -1,0 +1,10 @@
+node_modules/
+www/app.js
+desktop/www/
+desktop/dist/
+android/
+
+# 4.1.0 — لا ترفع مفاتيح الخدمة أبدًا
+serviceAccount*.json
+*-firebase-adminsdk-*.json
+tools/admin-worker/node_modules/
